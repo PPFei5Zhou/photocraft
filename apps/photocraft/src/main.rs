@@ -233,6 +233,29 @@ fn main() -> eframe::Result {
         None => (gpu_startup::Previous::Clean, None),
     };
     let env_backend = std::env::var("WGPU_BACKEND").ok();
+    // A host GPU that creates a wgpu device but paints nothing (Glenfly Arise): relaunch once with
+    // Mesa's software OpenGL so the window has a working adapter. Must happen before the instance
+    // exists; `std::env::set_var` is unsafe here, so the child gets the variable via `Command`.
+    // `PHOTOCRAFT_SOFTWARE_GL` is a one-shot guard so a child that lost the env cannot loop.
+    let vendors = gpu_startup::drm_vendors();
+    if !safe_gpu
+        && gpu_startup::should_relaunch_software_gl(
+            &vendors,
+            std::env::var("LIBGL_ALWAYS_SOFTWARE").ok().as_deref(),
+            std::env::var_os("PHOTOCRAFT_SOFTWARE_GL").is_some(),
+        )
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let launched = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .env("PHOTOCRAFT_SOFTWARE_GL", "1")
+            .spawn();
+        match launched {
+            Ok(_) => return Ok(()),
+            Err(error) => log::error!("could not start software OpenGL compatibility mode: {error}"),
+        }
+    }
     let plan = gpu_startup::plan_with_mode(pref, mode, previous.crashed(), env_backend.as_deref(), safe_gpu, os);
     if let Some(m) = previous.crashed() {
         log::warn!("the previous start didn't finish (GPU backend {}, adapter {:?}); {}", m.backend, m.adapter, plan.reason.as_deref().unwrap_or(""));

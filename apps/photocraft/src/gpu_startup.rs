@@ -31,6 +31,8 @@ use serde_json::{Value, json};
 pub const MARKER_FILE: &str = "gpu-starting.json";
 /// PCI vendor id of Intel.
 pub const INTEL: u32 = 0x8086;
+/// PCI vendor id of Glenfly (Zhaoxin) GPUs.
+pub const GLENFLY: u32 = 0x6766;
 /// Largest marker read (a marker is a few hundred bytes).
 const MARKER_MAX: u64 = 64 << 10;
 
@@ -212,10 +214,63 @@ pub struct Candidate {
     pub surface_ok: bool,
 }
 
+/// Whether this adapter is known to create a wgpu device but draw blank frames (empty present /
+/// transparent readback). Glenfly Arise (`0x6766`, Mesa "arise" / vendor `cx4`) does: the window
+/// opens and the device works, but nothing paints. Prefer a software adapter instead.
+pub fn unreliable_adapter(vendor: u32) -> bool {
+    vendor == GLENFLY
+}
+
+/// Every PCI vendor listed is unreliable, so there is no hardware path worth using.
+pub fn only_unreliable_gpus(vendors: &[u32]) -> bool {
+    !vendors.is_empty() && vendors.iter().all(|&v| unreliable_adapter(v))
+}
+
+/// PCI vendor ids of the host's DRM nodes (`/sys/class/drm/card*/device/vendor`). Empty when
+/// unreadable (no DRM, permission denied).
+pub fn drm_vendors() -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return out };
+    for entry in dir.flatten() {
+        let path = entry.path().join("device/vendor");
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if let Some(v) = parse_pci_vendor(text.trim()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Parse a sysfs PCI id (`0x6766`).
+pub fn parse_pci_vendor(text: &str) -> Option<u32> {
+    let t = text.trim();
+    u32::from_str_radix(t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t), 16).ok()
+}
+
+/// Whether this host should re-exec with `LIBGL_ALWAYS_SOFTWARE=1`.
+///
+/// Glenfly Arise (`0x6766`) is the only adapter and every wgpu backend draws blank frames, but
+/// Mesa's llvmpipe works — it is only listed when `LIBGL_ALWAYS_SOFTWARE` is set. `std::env::set_var`
+/// is `unsafe` in this edition (and the workspace forbids `unsafe`), so the app relaunches itself
+/// once with that variable, the same way `--safe-gpu` recovers from a driver crash. `PHOTOCRAFT_SOFTWARE_GL`
+/// is a one-shot guard so a child that lost the env cannot loop.
+pub fn should_relaunch_software_gl(vendors: &[u32], libgl_always_software: Option<&str>, already_relaunched: bool) -> bool {
+    if already_relaunched {
+        return false;
+    }
+    if libgl_always_software.is_some_and(|v| !v.trim().is_empty()) {
+        return false;
+    }
+    only_unreliable_gpus(vendors)
+}
+
 /// Rank of an adapter (lower is better): high-performance device types first (egui's power
 /// preference) or software adapters first for `cpu`; then backends, with DX12 before Vulkan for
-/// Intel on Windows.
+/// Intel on Windows. Adapters that draw blank frames lose to every working one.
 fn rank(a: &Candidate, backend: GpuBackend, os: Os) -> (u8, u8) {
+    if unreliable_adapter(a.vendor) && a.device_type != wgpu::DeviceType::Cpu {
+        return (9, 0);
+    }
     let ty = match a.device_type {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
@@ -266,7 +321,10 @@ pub fn configure(setup: &mut egui_wgpu::WgpuSetup, plan: &Plan, os: Os, sentinel
             let env = std::env::var("WGPU_DX12_COMPILER").ok();
             create.instance_descriptor.backend_options.dx12.shader_compiler = dx12_compiler(env.as_deref(), exe.as_deref().and_then(Path::parent));
         }
-        let select = plan.env.is_none() && (plan.backend == GpuBackend::Cpu || (plan.backend == GpuBackend::Auto && os == Os::Windows));
+        // Always pick ourselves when `WGPU_BACKEND` is unset: `pick` keeps known blank-frame
+        // adapters (Glenfly) below software ones. egui's default would take the high-performance
+        // device and paint nothing on those hosts.
+        let select = plan.env.is_none();
         if select {
             let backend = plan.backend;
             create.native_adapter_selector = Some(Arc::new(move |adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
@@ -290,6 +348,10 @@ pub fn configure(setup: &mut egui_wgpu::WgpuSetup, plan: &Plan, os: Os, sentinel
                 if backend == GpuBackend::Auto && intel_dx12_applied(&cands, i, os) {
                     *note.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some("Intel graphics on Windows: using DirectX 12 (the Intel Vulkan driver is known to crash)".into());
+                }
+                if cands.get(i).is_some_and(|c| unreliable_adapter(c.vendor)) {
+                    *note.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some("This GPU draws blank frames under wgpu; set LIBGL_ALWAYS_SOFTWARE=1 or use --safe-gpu".into());
                 }
                 adapters.get(i).cloned().ok_or_else(|| "no graphics adapter found".to_string())
             }));
@@ -521,6 +583,39 @@ mod tests {
         assert_eq!(pick(&a, Cpu, Os::Windows), Some(1));
         // No software adapter: still something.
         assert_eq!(pick(&a[..1], Cpu, Os::Windows), Some(0));
+    }
+
+    #[test]
+    fn blank_frame_gpus_lose_to_software_adapters() {
+        use wgpu::{Backend as B, DeviceType as T};
+        assert!(unreliable_adapter(GLENFLY));
+        assert!(!unreliable_adapter(INTEL));
+        assert!(!unreliable_adapter(0x10de));
+        // Glenfly GL (device_type Other) would win on performance rank; a llvmpipe CPU adapter
+        // must win because the Glenfly path paints nothing.
+        let glenfly = cand(GLENFLY, T::Other, B::Gl);
+        let llvmpipe = cand(0x1414, T::Cpu, B::Gl);
+        assert_eq!(pick(&[glenfly, llvmpipe], Auto, Os::Other), Some(1));
+        assert_eq!(pick(&[llvmpipe, glenfly], Auto, Os::Other), Some(0));
+        // Only the broken GPU: still usable (the window at least opens).
+        assert_eq!(pick(&[glenfly], Auto, Os::Other), Some(0));
+    }
+
+    #[test]
+    fn software_gl_is_forced_when_every_gpu_is_known_bad() {
+        assert!(only_unreliable_gpus(&[GLENFLY]));
+        assert!(!only_unreliable_gpus(&[]), "no GPU listed: leave the environment alone");
+        assert!(!only_unreliable_gpus(&[GLENFLY, INTEL]), "a working GPU is present");
+        assert_eq!(parse_pci_vendor("0x6766"), Some(GLENFLY));
+        assert_eq!(parse_pci_vendor("0x8086"), Some(INTEL));
+        assert_eq!(parse_pci_vendor("junk"), None);
+        let unset = None;
+        assert!(should_relaunch_software_gl(&[GLENFLY], unset, false));
+        assert!(!should_relaunch_software_gl(&[GLENFLY], Some("0"), false), "already configured");
+        assert!(!should_relaunch_software_gl(&[GLENFLY], unset, true), "one-shot guard");
+        assert!(!should_relaunch_software_gl(&[INTEL], unset, false));
+        assert!(!should_relaunch_software_gl(&[], unset, false));
+        assert!(should_relaunch_software_gl(&[GLENFLY], Some("  "), false), "blank means unset");
     }
 
     #[test]
